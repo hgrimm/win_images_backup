@@ -1,21 +1,23 @@
-// Bild-Backup CLI für Windows 10
-// - Sucht auf allen lokalen und verbundenen Laufwerken nach Bilddateien (konfigurierbare Ausnahmen)
-// - Dedupliziert per SHA-256-Hash
-// - Kopiert auf ein Ziel (externe Festplatte) und behält den ursprünglichen Pfad unterhalb des Ziels bei
-// - Erstellt eine einfache Indexdatei (JSON) mit bereits gesicherten Hashes
-// - Parallelisiert die Verarbeitung und protokolliert den Fortschritt
+// Image Backup CLI for Windows 10
+// - Scans all local and connected drives for image files (configurable exclusions)
+// - Deduplicates using SHA-256 hash
+// - Copies to a target drive (external HDD) while preserving the original path structure
+// - Maintains a simple JSON index of already backed-up hashes
+// - Parallel processing and basic progress reporting
 //
-// Build (auf Windows):
-//   go build -o imgbackup.exe
-// Beispielaufruf:
-//   imgbackup.exe -dest E:\backup -exclude D,F -exclude-dirs "Windows,Program Files,ProgramData" -workers 4 -log backup.log
+// Build (Windows):
+//   go build -o win_images_backup.exe
 //
-// Hinweise:
-// - Das Ziel-Laufwerk (dest) wird automatisch von der Suche ausgeschlossen.
-// - Zusätzliche Verzeichnisse können mit -exclude-dirs ausgeschlossen werden (Namen oder absolute Pfade). Standard-Ausschlüsse sind u. a. Windows-, Program Files-, ProgramData-, Recycle- und Temp-Ordner; mit -no-default-excludes deaktivierbar.
-// - LANGE PFADNAMEN: Der Präfix "\\?\\" wird nur gesetzt, wenn nötig (UNC oder sehr langer Pfad).
-// - Die Indexdatei liegt standardmäßig im Ziel unter backup_index.json.
-// - Standard-Bilderweiterungen sind in der Variable defaultExts definiert und können via -ext angepasst werden.
+// Example:
+//   win_images_backup.exe -dest E:\backup -exclude D,F -exclude-dirs "Windows,Program Files,ProgramData" -workers 4 -log backup.log
+//
+// Notes:
+// - The destination drive (dest) is automatically excluded from scanning.
+// - You can exclude additional directories via -exclude-dirs (names or absolute paths).
+//   Default excludes include Windows/, Program Files/, ProgramData/, recycle and temp folders; disable via -no-default-excludes.
+// - LONG PATHS: The \\?\ prefix (or \\?\UNC for UNC paths) is added only when necessary (UNC or very long path).
+// - The index file defaults to <dest>\backup_index.json.
+// - Default image extensions are listed in defaultExts and can be overridden via -ext.
 
 package main
 
@@ -38,7 +40,7 @@ import (
 	"time"
 )
 
-// Job beschreibt eine zu sichernde Datei
+// Job describes a file to back up
 type job struct {
 	srcPath string
 	rel     string
@@ -69,7 +71,7 @@ var defaultExts = []string{
 	".psd", ".svg",
 }
 
-// Standard-Verzeichnis-Ausschlüsse
+// Default directory excludes (can be disabled via -no-default-excludes)
 var defaultDirExcludes = []string{
 	"Windows", "Program Files", "Program Files (x86)", "ProgramData",
 	"$Recycle.Bin", "System Volume Information", "AppData", "Temp", "tmp",
@@ -94,7 +96,7 @@ func newDirExcluder(flagVal string, useDefaults bool, destRoot string) dirExclud
 				continue
 			}
 			low := strings.ToLower(s)
-			// Absolute Pfade erkennen (C:\..., \\server\share)
+			// Detect absolute paths (C:\..., \\server\share)
 			if strings.Contains(low, ":\\") || strings.HasPrefix(low, `\\`) {
 				de.absPrefixes = append(de.absPrefixes, strings.ToLower(filepath.Clean(s)))
 			} else {
@@ -102,6 +104,7 @@ func newDirExcluder(flagVal string, useDefaults bool, destRoot string) dirExclud
 			}
 		}
 	}
+	// Always exclude the destination root by absolute prefix
 	if destRoot != "" {
 		de.absPrefixes = append(de.absPrefixes, strings.ToLower(filepath.Clean(destRoot)))
 	}
@@ -122,10 +125,10 @@ func (de dirExcluder) skipDir(path string, d os.DirEntry) bool {
 	return false
 }
 
-// Indexformat: Menge von Hashes
+// Index keeps a set of hashes (and minor metadata)
 type Index struct {
 	Version int               `json:"version"`
-	Hashes  map[string]uint32 `json:"hashes"`
+	Hashes  map[string]uint32 `json:"hashes"` // value: copy count (optional)
 	Updated time.Time         `json:"updated"`
 }
 
@@ -137,7 +140,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Logging
+	// Logging setup
 	if *logFile != "" {
 		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
@@ -148,36 +151,35 @@ func main() {
 		log.SetOutput(f)
 	}
 
-	// Zielpfad
+	// Normalize destination and ensure it exists
 	absDest, err := filepath.Abs(*destDir)
 	if err != nil {
 		fatalf("Zielpfad ungültig: %v", err)
 	}
-
-	// Zielverzeichnis anlegen
 	if !*dryRun {
 		if err := os.MkdirAll(absDest, 0755); err != nil {
 			fatalf("Konnte Zielverzeichnis nicht erstellen: %v", err)
 		}
 	}
 
+	// Exclude destination drive automatically
 	destDrive := driveLetter(absDest)
 	excluded := parseExclude(*exclude)
 	if destDrive != "" {
 		excluded[strings.ToUpper(destDrive)] = true
 	}
 
-	// Erweiterungen vorbereiten
+	// Prepare extension set
 	exts := prepareExts(*extFlag)
 
-	// Index laden
+	// Load/prepare index
 	indexPath := *indexName
 	if !filepath.IsAbs(indexPath) {
 		indexPath = filepath.Join(absDest, *indexName)
 	}
 	idx := loadIndex(indexPath)
 
-	// Laufwerke auflisten
+	// Enumerate drives A:..Z:
 	drives := listDrives()
 	var sources []string
 	for _, d := range drives {
@@ -196,14 +198,13 @@ func main() {
 	fmt.Printf("Quellen: %s\n", strings.Join(sources, ", "))
 	fmt.Printf("Worker: %d, Dry-Run: %v\n", *workers, *dryRun)
 
-	// Verzeichnis-Ausschlüsse
+	// Directory excludes
 	de := newDirExcluder(*excludeDirs, !*noDefaultExcludes, absDest)
 
-	// Job-Queue
+	// Work queue & workers
 	jobs := make(chan job, 1024)
 	var wg sync.WaitGroup
 
-	// Worker
 	results := make(chan string, 1024)
 	errs := make(chan error, 64)
 
@@ -219,14 +220,14 @@ func main() {
 		}(i + 1)
 	}
 
-	// Fehler-Logger
+	// Error logger
 	go func() {
 		for e := range errs {
 			log.Printf("FEHLER: %v\n", e)
 		}
 	}()
 
-	// Fortschritt-Reporter
+	// Progress reporter
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
@@ -256,11 +257,11 @@ func main() {
 		}
 	}()
 
-	// Scannen
+	// Walk all sources and enqueue files
 	for _, root := range sources {
 		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
-				// Zugriff verweigert etc.
+				// Access errors etc.
 				log.Printf("Zugriffsproblem bei %s: %v\n", path, err)
 				return nil
 			}
@@ -271,16 +272,16 @@ func main() {
 				}
 				return nil
 			}
-			// Symbolische Links vermeiden
+			// Ignore symlinks
 			if isSymlink(d) {
 				return nil
 			}
-			// Dateiendung prüfen
+			// Extension filter
 			ext := strings.ToLower(filepath.Ext(d.Name()))
 			if !exts[ext] {
 				return nil
 			}
-			// Dateigröße
+			// File size
 			info, err := d.Info()
 			if err != nil {
 				return nil
@@ -309,7 +310,7 @@ func main() {
 	close(results)
 	<-done
 
-	// Index final speichern
+	// Final index save
 	idx.Updated = time.Now().UTC()
 	if err := saveIndex(indexPath, idx); err != nil {
 		log.Printf("Index-Speicherfehler: %v\n", err)
@@ -358,7 +359,7 @@ func prepareExts(flagVal string) map[string]bool {
 }
 
 func listDrives() []string {
-	// Einfache Variante: A: bis Z: prüfen
+	// Probe A:..Z: by stat
 	var drives []string
 	for c := 'A'; c <= 'Z'; c++ {
 		root := fmt.Sprintf("%c:\\", c)
@@ -374,7 +375,7 @@ func isSymlink(d os.DirEntry) bool {
 	if d.Type()&os.ModeSymlink != 0 {
 		return true
 	}
-	// Fallback: Lstat prüfen
+	// Fallback: Lstat via Info
 	if info, err := d.Info(); err == nil {
 		return info.Mode()&os.ModeSymlink != 0
 	}
@@ -388,12 +389,12 @@ func driveLetter(path string) string {
 	return ""
 }
 
-// konservativ entscheiden, ob Langpfadpräfix nötig ist
+// Decide conservatively whether the long-path prefix is needed
 func needsLongPath(p string) bool {
 	if strings.HasPrefix(p, `\\`) { // UNC
 		return true
 	}
-	const maxShort = 248 // unterhalb MAX_PATH
+	const maxShort = 248 // safely below MAX_PATH
 	return len(p) > maxShort
 }
 
@@ -414,7 +415,7 @@ func withLongPath(p string) string {
 }
 
 func processFile(j job, destRoot, indexPath string, idx *Index, dry bool, results chan<- string) error {
-	// DRY-RUN: keine Dateiöffnungen/Hashes – nur Plan ausgeben
+	// DRY-RUN: do not open/hash files, just show the plan
 	if dry {
 		dst := filepath.Join(destRoot, j.drive, j.rel)
 		fmt.Printf("[DRY] Würde kopieren: %s -> %s\n", j.srcPath, dst)
@@ -422,9 +423,10 @@ func processFile(j job, destRoot, indexPath string, idx *Index, dry bool, result
 		return nil
 	}
 
-	// Hash berechnen
+	// Compute hash
 	h, err := hashFile(j.srcPath)
 	if err != nil {
+		// Skip invalid-name issues silently (common with installer artifacts)
 		if isInvalidNameErr(err) {
 			log.Printf("WARN: Überspringe ungültigen Pfad: %s (%v)\n", j.srcPath, err)
 			results <- "SKIPPED:1"
@@ -433,7 +435,7 @@ func processFile(j job, destRoot, indexPath string, idx *Index, dry bool, result
 		return fmt.Errorf("Hashfehlgeschlagen %s: %w", j.srcPath, err)
 	}
 
-	// Deduplizierung prüfen
+	// Dedup check
 	idxMu.Lock()
 	_, exists := idx.Hashes[h]
 	idxMu.Unlock()
@@ -442,15 +444,15 @@ func processFile(j job, destRoot, indexPath string, idx *Index, dry bool, result
 		return nil
 	}
 
-	// Zielpfad konstruieren: <dest>/<DRIVE>/<rel>
+	// Destination path: <dest>/<DRIVE>/<rel>
 	dst := filepath.Join(destRoot, j.drive, j.rel)
 
-	// Zielverzeichnis anlegen
+	// Ensure destination directory
 	if err := os.MkdirAll(withLongPath(filepath.Dir(dst)), 0755); err != nil {
 		return fmt.Errorf("Konnte Zielverzeichnis nicht erstellen: %w", err)
 	}
 
-	// Existenz prüfen: wenn Datei existiert und gleiche Größe
+	// If destination exists with same size, treat as identical
 	if fi, err := os.Stat(withLongPath(dst)); err == nil {
 		if fi.Size() == j.size {
 			idxMu.Lock()
@@ -477,13 +479,13 @@ func processFile(j job, destRoot, indexPath string, idx *Index, dry bool, result
 }
 
 func hashFile(path string) (string, error) {
-	// 1) normal versuchen
+	// Try normally first
 	f, err := os.Open(path)
 	if err != nil {
 		if isInvalidNameErr(err) {
 			return "", err
 		}
-		// 2) ggf. mit Langpfadpräfix erneut
+		// Retry with long-path prefix
 		f2, err2 := os.Open(withLongPath(path))
 		if err2 != nil {
 			return "", err
@@ -521,7 +523,7 @@ func copyFile(src, dst string) error {
 	}
 	defer s.Close()
 
-	// Temporärdatei, dann umbenennen (atomic-ish)
+	// Write to temp file then rename (atomic-ish)
 	tmp := dst + ".part"
 	if err := os.MkdirAll(withLongPath(filepath.Dir(dst)), 0755); err != nil {
 		return err
@@ -544,7 +546,7 @@ func copyFile(src, dst string) error {
 		return err
 	}
 
-	// Umbenennen
+	// Rename into place
 	if err := os.Rename(withLongPath(tmp), withLongPath(dst)); err != nil {
 		return err
 	}
@@ -584,7 +586,7 @@ func max(a, b int) int {
 	return b
 }
 
-// erkennt ERROR_INVALID_NAME ("Der angegebene Pfadname ist ungültig") robust per Text
+// Detect ERROR_INVALID_NAME via message text (robust enough across locales)
 func isInvalidNameErr(err error) bool {
 	if err == nil {
 		return false
