@@ -113,4 +113,4 @@ E:\backup\
 Issues and PRs are welcome. When filing an issue, include a log excerpt, Windows version, and the exact CLI command you ran.
 
 ## License
-Choose a license (e.g., MIT) and add a `LICENSE` file.
+GNU GENERAL PUBLIC LICENSE Version 3
